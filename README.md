@@ -10,7 +10,7 @@ Not implemented:
 - Calendar: accepting/rejecting invitations
   
 
-I your server supports EAS v14 (Exchange 2016/2019/SE(?)) the add-on will autoselect EAS v16.1 protocol version whenever avaailable.
+I your server supports EAS v14 (Exchange 2016/2019/SE(?)) the add-on will autoselect EAS v16.1 protocol version whenever available.
 
 This can be changed to desired version in 'Account Settings' in TbSync account manager.
 
