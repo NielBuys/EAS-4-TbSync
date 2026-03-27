@@ -4,11 +4,14 @@
 
 Initial support for protocol version 16.1 introduced in this version:
 - Calendar/Contacts/Tasks editing and synchronization is working
+
 Not implemented:
+
 - Calendar: accepting/rejecting invitations
   
 
-I your server supports EAS v14 (Exchange 2016/2019/SE(?)) the add-on will autoselect EAS v16.1 protocol version whenever avaailable. 
+I your server supports EAS v14 (Exchange 2016/2019/SE(?)) the add-on will autoselect EAS v16.1 protocol version whenever avaailable.
+
 This can be changed to desired version in 'Account Settings' in TbSync account manager.
 
 ([EAS protocol v 14 support for Exchange Online ends on 01.03.2026](https://techcommunity.microsoft.com/blog/exchange/exchange-online-activesync-device-support-update/4477997))
