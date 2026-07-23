@@ -118,8 +118,11 @@ var network = {
                 return accountData.getAccountProperty("user");
             },
 
-            get password() {
-                return TbSync.passwordManager.getLoginInfo(this.host, "TbSync/EAS", this.user);
+            // TbSync.passwordManager.getLoginInfo is async since Thunderbird 153
+            // (findLogins was replaced by the async searchLoginsAsync), so the
+            // password can no longer be exposed via a synchronous getter.
+            getPassword: async function () {
+                return await TbSync.passwordManager.getLoginInfo(this.host, "TbSync/EAS", this.user);
             },
 
             get accountname() {
@@ -236,9 +239,9 @@ var network = {
             // This function gets called if we have no accessToken, or the token
             // is expired. Load current data from password manager into the
             // properties used by the OAuth module.
-            oauth.accessToken = oauth.getToken("accessToken");
-            oauth.refreshToken = oauth.getToken("refreshToken");
-            oauth.tokenExpires = oauth.getToken("tokenExpires");
+            oauth.accessToken = await oauth.getToken("accessToken");
+            oauth.refreshToken = await oauth.getToken("refreshToken");
+            oauth.tokenExpires = await oauth.getToken("tokenExpires");
 
             try {
                 // refresh = false will do nothing and resolve immediately, if
@@ -282,9 +285,9 @@ var network = {
             return false;
         };
 
-        oauth.isExpired = function () {
+        oauth.isExpired = async function () {
             const OAUTH_GRACE_TIME = 30 * 1000;
-            return (oauth.getToken("tokenExpires") - OAUTH_GRACE_TIME < new Date().getTime());
+            return ((await oauth.getToken("tokenExpires")) - OAUTH_GRACE_TIME < new Date().getTime());
         };
 
         const OAUTHVALUES = [
@@ -327,16 +330,16 @@ var network = {
                 return tokensObj;
             };
 
-            oauth.getToken = function (tokenName) {
+            oauth.getToken = async function (tokenName) {
                 let oauthValue = OAUTHVALUES.find(e => e[2] == tokenName);
-                return oauth.parseAndSanitizeTokenString(oauth.authData.password)[oauthValue[0]];
+                return oauth.parseAndSanitizeTokenString(await oauth.authData.getPassword())[oauthValue[0]];
             };
 
             oauth.setToken = async function (tokenName, val) {
                 oauth[tokenName] = val;
 
                 let oauthValue = OAUTHVALUES.find(e => e[2] == tokenName);
-                let tokens = oauth.parseAndSanitizeTokenString(oauth.authData.password);
+                let tokens = oauth.parseAndSanitizeTokenString(await oauth.authData.getPassword());
                 let valueChanged = (val != tokens[oauthValue[0]])
                 if (valueChanged) {
                     tokens[oauthValue[0]] = val;
@@ -344,7 +347,7 @@ var network = {
                 }
             };
         } else {
-            oauth.getToken = function (tokenName) {
+            oauth.getToken = async function (tokenName) {
                 return oauth[tokenName];
             };
 
@@ -440,7 +443,7 @@ var network = {
             }
 
             // check OAuth situation before connecting
-            if (oauthData && (!oauthData.getToken("accessToken") || oauthData.isExpired())) {
+            if (oauthData && (!(await oauthData.getToken("accessToken")) || (await oauthData.isExpired()))) {
                 syncData.setSyncState("oauthprompt");
                 let _rv = {}
                 if (!(await oauthData.asyncConnect(_rv))) {
@@ -465,13 +468,16 @@ var network = {
         }
     },
 
-    sendRequestPromise: function (wbxml, command, syncData, allowSoftFail = false) {
+    sendRequestPromise: async function (wbxml, command, syncData, allowSoftFail = false) {
         let msg = "Sending data <" + syncData.getSyncState().state + "> for " + syncData.accountData.getAccountProperty("accountname");
         if (syncData.currentFolderData) msg += " (" + syncData.currentFolderData.getFolderProperty("foldername") + ")";
         syncData.request = eas.network.logXML(wbxml, msg);
         syncData.response = "";
 
         let connection = eas.network.getAuthData(syncData.accountData);
+        // Resolve the password up front (async since TB153) so the XHR
+        // Promise executor below can stay synchronous.
+        let password = await connection.getPassword();
         let userAgent = syncData.accountData.getAccountProperty("useragent"); //plus calendar.useragent.extra = Lightning/5.4.5.2
         let deviceType = syncData.accountData.getAccountProperty("devicetype");
         let deviceId = syncData.accountData.getAccountProperty("deviceId");
@@ -493,11 +499,11 @@ var network = {
             syncData.req.overrideMimeType("text/plain");
             syncData.req.setRequestHeader("User-Agent", userAgent);
             syncData.req.setRequestHeader("Content-Type", "application/vnd.ms-sync.wbxml");
-            if (connection.password) {
+            if (password) {
                 if (eas.network.getOAuthObj({ accountData: syncData.accountData })) {
-                    syncData.req.setRequestHeader("Authorization", 'Bearer ' + eas.network.getOAuthValue(connection.password, "access"));
+                    syncData.req.setRequestHeader("Authorization", 'Bearer ' + eas.network.getOAuthValue(password, "access"));
                 } else {
-                    syncData.req.setRequestHeader("Authorization", 'Basic ' + TbSync.tools.b64encode(connection.user + ':' + connection.password));
+                    syncData.req.setRequestHeader("Authorization", 'Basic ' + TbSync.tools.b64encode(connection.user + ':' + password));
                 }
             }
 
@@ -1073,7 +1079,7 @@ var network = {
 
         for (let i = 0; i < 2; i++) {
             // check OAuth situation before connecting
-            if (oauthData && (!oauthData.getToken("accessToken") || oauthData.isExpired())) {
+            if (oauthData && (!(await oauthData.getToken("accessToken")) || (await oauthData.isExpired()))) {
                 let _rv = {}
                 if (!(await oauthData.asyncConnect(_rv))) {
                     throw eas.sync.finish("error", _rv.error);
@@ -1081,6 +1087,10 @@ var network = {
             }
 
             try {
+                // Resolve the password (async since TB153) before building the
+                // synchronous XHR Promise; re-read each iteration so an OAuth
+                // token refresh on a prior 401 is picked up.
+                let password = await authData.getPassword();
                 let contextData = eas.network.getContextData({ accountData });
                 let uri = Services.io.newURI(eas.network.getEasURL(accountData) + '?Cmd=' + command + '&User=' + encodeURIComponent(authData.user) + '&DeviceType=' + encodeURIComponent(deviceType) + '&DeviceId=' + deviceId);
                 let response = await new Promise(function (resolve, reject) {
@@ -1091,11 +1101,11 @@ var network = {
                     req.setRequestHeader("User-Agent", userAgent);
                     req.setRequestHeader("Content-Type", "application/vnd.ms-sync.wbxml");
 
-                    if (authData.password) {
+                    if (password) {
                         if (eas.network.getOAuthObj({ accountData })) {
-                            req.setRequestHeader("Authorization", 'Bearer ' + eas.network.getOAuthValue(authData.password, "access"));
+                            req.setRequestHeader("Authorization", 'Bearer ' + eas.network.getOAuthValue(password, "access"));
                         } else {
-                            req.setRequestHeader("Authorization", 'Basic ' + TbSync.tools.b64encode(authData.user + ':' + authData.password));
+                            req.setRequestHeader("Authorization", 'Basic ' + TbSync.tools.b64encode(authData.user + ':' + password));
                         }
                     }
 
@@ -1205,7 +1215,7 @@ var network = {
             retry = false;
 
             // Check OAuth situation before connecting
-            if (oauthData && (!oauthData.getToken("accessToken") || oauthData.isExpired())) {
+            if (oauthData && (!(await oauthData.getToken("accessToken")) || (await oauthData.isExpired()))) {
                 let _rv = {};
                 syncData.setSyncState("oauthprompt");
                 if (!(await oauthData.asyncConnect(_rv))) {
@@ -1213,6 +1223,10 @@ var network = {
                 }
             }
 
+            // Resolve the password (async since TB153) before building the
+            // synchronous XHR Promise; re-read each iteration so an OAuth token
+            // refresh on a prior 401 is picked up.
+            let password = await authData.getPassword();
             let contextData = eas.network.getContextData({ accountData: syncData.accountData });
             let uri = Services.io.newURI(eas.network.getEasURL(syncData.accountData));
             let result = await new Promise(function (resolve, reject) {
@@ -1221,11 +1235,11 @@ var network = {
                 syncData.req.open("OPTIONS", uri.spec, true);
                 syncData.req.overrideMimeType("text/plain");
                 syncData.req.setRequestHeader("User-Agent", userAgent);
-                if (authData.password) {
+                if (password) {
                     if (eas.network.getOAuthObj({ accountData: syncData.accountData })) {
-                        syncData.req.setRequestHeader("Authorization", 'Bearer ' + eas.network.getOAuthValue(authData.password, "access"));
+                        syncData.req.setRequestHeader("Authorization", 'Bearer ' + eas.network.getOAuthValue(password, "access"));
                     } else {
-                        syncData.req.setRequestHeader("Authorization", 'Basic ' + TbSync.tools.b64encode(authData.user + ':' + authData.password));
+                        syncData.req.setRequestHeader("Authorization", 'Basic ' + TbSync.tools.b64encode(authData.user + ':' + password));
                     }
                 }
                 syncData.req.timeout = eas.Base.getConnectionTimeout();
@@ -1345,7 +1359,7 @@ var network = {
         let authData = eas.network.getAuthData(syncData.accountData);
 
         syncData.setSyncState("send.request.autodiscover");
-        let result = await eas.network.getServerConnectionViaAutodiscover(authData.accountname, authData.user, authData.password, 30 * 1000);
+        let result = await eas.network.getServerConnectionViaAutodiscover(authData.accountname, authData.user, await authData.getPassword(), 30 * 1000);
 
         syncData.setSyncState("eval.response.autodiscover");
         if (result.errorcode == 200) {
