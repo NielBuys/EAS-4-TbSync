@@ -197,9 +197,13 @@ var network = {
 
         switch (host) {
             case "outlook.office365.com":
-                config.scope = "offline_access https://outlook.office.com/.default";
-                break;
             case "eas.outlook.com":
+                // Use the resource-specific EAS scope for both hosts. Requesting the
+                // ".default" scope triggered AADSTS70011 (".default scope can't be
+                // combined with resource-specific scopes") once Thunderbird's OAuth
+                // layer merged it with the EAS.AccessAsUser.All scope the tenant
+                // grants. Dropping ".default" leaves an all-resource-specific request,
+                // which Microsoft accepts.
                 config.scope = "offline_access https://outlook.office.com/EAS.AccessAsUser.All";
                 break;
         }
