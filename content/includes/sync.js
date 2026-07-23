@@ -1345,8 +1345,16 @@ var sync = {
                 // Exception could be an object or an array of objects
                 let exceptions = [].concat(data.Exceptions.Exception);
                 for (let exception of exceptions) {
-                    //exception.ExceptionStartTime is in UTC, but the Recurrence Object is in local timezone
-                    let dateTime = TbSync.lightning.cal.createDateTime(exception.ExceptionStartTime).getInTimezone(timezone);
+                    // The occurrence being overridden is identified by InstanceId in
+                    // EAS 16.x (AirSyncBase namespace) and by ExceptionStartTime in
+                    // older protocol versions (2.5/14.x). Both are UTC, while the
+                    // Recurrence object is in the local timezone. Without the
+                    // InstanceId fallback, 16.x exceptions - which only send InstanceId -
+                    // resolved to an undefined date, so the original occurrence was
+                    // never overridden/removed and moved or cancelled occurrences
+                    // showed up as duplicate/stray items.
+                    let originalInstance = exception.InstanceId || exception.ExceptionStartTime;
+                    let dateTime = TbSync.lightning.cal.createDateTime(originalInstance).getInTimezone(timezone);
                     if (data.AllDayEvent == "1") {
                         dateTime.isDate = true;
                         // Pass to replacement event unless overriden
