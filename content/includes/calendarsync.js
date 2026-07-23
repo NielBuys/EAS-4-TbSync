@@ -264,6 +264,18 @@ var Calendar = {
         if (tbStatus) item.setProperty("STATUS", tbStatus)
         else item.deleteProperty("STATUS");
 
+        // Exchange prepends a localized "Canceled: " to the Subject of a cancelled
+        // meeting (or cancelled occurrence of a recurring series). That word is
+        // redundant with STATUS=CANCELLED - which already renders the item
+        // struck-through - and, because it is baked into the stored title, it
+        // lingers even after the occurrence is reactivated or moved. Strip it so a
+        // cancelled item shows a clean, struck-through title, matching CalDAV/Google.
+        // (Handles the English "Canceled:"/"Cancelled:" prefix; other UI locales
+        // would need their localized word added here.)
+        if (tbStatus == "CANCELLED" && item.title) {
+            item.title = item.title.replace(/^\s*cancell?ed:\s*/i, "");
+        }
+
         // If this was an incoming exception, properly register it on the master
         if (item._isIncomingException) {
             let master = tbItem instanceof TbSync.lightning.TbItem ? tbItem.nativeItem : tbItem;
