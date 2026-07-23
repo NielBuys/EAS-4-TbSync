@@ -144,7 +144,7 @@
         "message": "Add sync support for Exchange ActiveSync accounts to TbSync (contacts, tasks and calendars)."
     },
     "extensionName": {
-        "message": "Provider for Exchange ActiveSync"
+        "message": "Provider for Exchange ActiveSync (NielBuys fork)"
     },
     "helplink.BadItemSkipped": {
         "message": "https://github.com/jobisoft/EAS-4-TbSync/wiki/Error:-Bad-item-skipped"
