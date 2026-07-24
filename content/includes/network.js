@@ -197,9 +197,13 @@ var network = {
 
         switch (host) {
             case "outlook.office365.com":
-                config.scope = "offline_access https://outlook.office.com/.default";
-                break;
             case "eas.outlook.com":
+                // Use the resource-specific EAS scope for both hosts. Requesting the
+                // ".default" scope triggered AADSTS70011 (".default scope can't be
+                // combined with resource-specific scopes") once Thunderbird's OAuth
+                // layer merged it with the EAS.AccessAsUser.All scope the tenant
+                // grants. Dropping ".default" leaves an all-resource-specific request,
+                // which Microsoft accepts.
                 config.scope = "offline_access https://outlook.office.com/EAS.AccessAsUser.All";
                 break;
         }
@@ -243,10 +247,16 @@ var network = {
             oauth.refreshToken = await oauth.getToken("refreshToken");
             oauth.tokenExpires = await oauth.getToken("tokenExpires");
 
+            // Force a real token refresh when there is no access token or the
+            // current one is (about to be) expired. Passing refresh=false let
+            // OAuth2.connect() early-return on a stale-but-present token whose
+            // module-side expiry tracking reads as valid, so Thunderbird kept
+            // sending a dead token until Microsoft returned 401 invalid_token
+            // (the "works ~1h then stops until account recreate" symptom).
+            let forceRefresh = !oauth.accessToken || (await oauth.isExpired());
+
             try {
-                // refresh = false will do nothing and resolve immediately, if
-                // a valid accessToken exists.
-                await oauth.connect(/* with UI */ true, /* refresh */ false);
+                await oauth.connect(/* with UI */ true, /* refresh */ forceRefresh);
             } catch (e) {
                 rv.error = eas.tools.isString(e) ? e : JSON.stringify(e);
             }
@@ -287,7 +297,14 @@ var network = {
 
         oauth.isExpired = async function () {
             const OAUTH_GRACE_TIME = 30 * 1000;
-            return ((await oauth.getToken("tokenExpires")) - OAUTH_GRACE_TIME < new Date().getTime());
+            // Prefer the real expiry embedded in the access token (JWT `exp`).
+            // The separately-stored tokenExpires can read as "never expires" on
+            // TB153, which caused expired tokens to be sent until a 401. Fall
+            // back to the stored value only if the token cannot be decoded.
+            let accessToken = await oauth.getToken("accessToken");
+            let jwtExpiry = eas.network.getTokenExpiryMs(accessToken);
+            let tokenExpires = jwtExpiry || (await oauth.getToken("tokenExpires"));
+            return (tokenExpires - OAUTH_GRACE_TIME < new Date().getTime());
         };
 
         const OAUTHVALUES = [
@@ -357,6 +374,23 @@ var network = {
         }
 
         return oauth;
+    },
+
+    // Returns the real expiry (ms since epoch) from a JWT access token's `exp`
+    // claim, or 0 if it cannot be determined. This is the authoritative expiry
+    // source: the separately-stored tokenExpires is unreliable on TB153 (it
+    // defaults to Number.MAX_VALUE whenever an expires_in is missed), which
+    // left expired tokens in use until Microsoft returned 401 invalid_token.
+    getTokenExpiryMs: function (accessToken) {
+        try {
+            if (!accessToken || accessToken.indexOf(".") == -1) return 0;
+            let payload = accessToken.split(".")[1].replace(/-/g, "+").replace(/_/g, "/");
+            while (payload.length % 4) payload += "=";
+            let claims = JSON.parse(atob(payload));
+            return claims.exp ? claims.exp * 1000 : 0;
+        } catch (e) {
+            return 0;
+        }
     },
 
     getOAuthValue: function (currentTokenString, type = "access") {
