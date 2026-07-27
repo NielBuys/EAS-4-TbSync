@@ -1,14 +1,14 @@
 {
   "applications": {
     "gecko": {
-      "id": "eas4tbsync@jobisoft.de",
+      "id": "eas4tbsync@nielbuys.fork",
       "strict_min_version": "136.0",
       "strict_max_version": "160.*"
     }
   },
   "manifest_version": 2,
   "name": "__MSG_extensionName__",
-  "version": "4.17.7",
+  "version": "4.17.8",
   "author": "John Bieling",
   "homepage_url": "https://github.com/NielBuys/EAS-4-TbSync",
   "default_locale": "en-US",

@@ -16,7 +16,7 @@
   async function observeTbSyncInitialized(aSubject, aTopic, aData) {
     try {
       const tbsyncExtension = ExtensionParent.GlobalManager.getExtension(
-        "tbsync@jobisoft.de"
+        "tbsync@nielbuys.fork"
       );
       const { TbSync } = ChromeUtils.importESModule(
         `chrome://tbsync/content/tbsync.sys.mjs?${tbsyncExtension.manifest.version}`
@@ -24,7 +24,7 @@
       // Load this provider add-on into TbSync
       if (TbSync.enabled) {
         const easExtension = ExtensionParent.GlobalManager.getExtension(
-          "eas4tbsync@jobisoft.de"
+          "eas4tbsync@nielbuys.fork"
         );
         console.log(`Registering EAS provider v${easExtension.manifest.version} with TbSync v${tbsyncExtension.manifest.version}`);
         await TbSync.providers.loadProvider(easExtension, "eas", "chrome://eas4tbsync/content/provider.js");
@@ -59,7 +59,7 @@
       //unload this provider add-on from TbSync
       try {
         const tbsyncExtension = ExtensionParent.GlobalManager.getExtension(
-          "tbsync@jobisoft.de"
+          "tbsync@nielbuys.fork"
         );
         const { TbSync } = ChromeUtils.importESModule(
           `chrome://tbsync/content/tbsync.sys.mjs?${tbsyncExtension.manifest.version}`
