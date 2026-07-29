@@ -473,6 +473,19 @@ var sync = {
             let addedItems = {};
             let sendItems = [];
 
+            // An RSVP (Accept / Tentative / Decline of a meeting invitation) must be sent
+            // with the EAS MeetingResponse command instead of being pushed as a generic
+            // item change - see eas.network.sendMeetingResponse. MeetingResponse is its
+            // own EAS command, so these are collected here and sent separately below.
+            let invitationResponses = [];
+            // MeetingResponse is mandatory since EAS 2.5, but only reroute when the server
+            // did not explicitly tell us otherwise: an empty list means the OPTIONS probe
+            // never returned MS-ASProtocolCommands, and falling back to a generic push
+            // would silently re-introduce the duplicate-meeting bug this avoids.
+            let allowedCommands = syncData.accountData.getAccountProperty("allowedEasCommands");
+            let canSendMeetingResponse = (syncData.type == "Calendar") && !!eas.sync.Calendar
+                && (!allowedCommands || allowedCommands.split(",").includes("MeetingResponse"));
+
             // BUILD WBXML
             let wbxml = eas.wbxmltools.createWBXML();
             wbxml.otag("Sync");
@@ -497,6 +510,31 @@ var sync = {
                                 TbSync.eventlog.add("warning", syncData.eventLogInfo, "MailingListNotSupportedItemSkipped");
                                 syncData.target.removeItemFromChangeLog(changes[i].itemId);
                             } else if (syncData.type == eas.sync.getEasItemType(item)) {
+
+                                // Thunderbird's itip engine may have answered an emailed invitation
+                                // by creating a second, parallel item instead of editing the copy we
+                                // already synced. Send the response for the synced item and drop this
+                                // Add, which Exchange would otherwise turn into a new, self organized
+                                // meeting - duplicating the event and re-inviting everybody.
+                                let duplicate = canSendMeetingResponse
+                                    ? await eas.sync.Calendar.matchInvitationResponse(item, syncData)
+                                    : null;
+                                if (duplicate) {
+                                    invitationResponses.push({
+                                        itemId: changes[i].itemId,
+                                        serverID: duplicate.serverID,
+                                        duplicateOf: duplicate.serverID,
+                                        exactMatch: duplicate.exact,
+                                        // a duplicate created by itip always answers the series
+                                        responses: [{
+                                            userResponse: duplicate.userResponse,
+                                            partstat: duplicate.partstat,
+                                            instanceId: null,
+                                            exceptionId: null
+                                        }]
+                                    });
+                                    break;
+                                }
 
                                 let asversion = syncData.accountData.getAccountProperty("asversion");
 
@@ -557,6 +595,39 @@ var sync = {
                         if (item) {
                             //filter out bad object types for this folder
                             if (syncData.type == eas.sync.getEasItemType(item)) {
+
+                                // Clicking Accept / Tentative / Decline on a received invitation only
+                                // flips the participation status of our own attendee entry - on the
+                                // series, or on a single occurrence, which Thunderbird records as an
+                                // exception. That is an RSVP, not an ordinary edit, and has to go out
+                                // as a MeetingResponse. Pushing it as a Sync <Change> tells the server
+                                // nothing (we deliberately never send AttendeeStatus), so the response
+                                // would be silently lost.
+                                let detected = (syncData.type == "Calendar" && eas.sync.Calendar)
+                                    ? eas.sync.Calendar.detectInvitationResponses(item, syncData)
+                                    : [];
+                                if (detected.length) {
+                                    if (canSendMeetingResponse) {
+                                        invitationResponses.push({
+                                            itemId: changes[i].itemId,
+                                            serverID: changes[i].itemId,
+                                            responses: detected
+                                        });
+                                    } else {
+                                        // Never fall through to the generic push here: it cannot carry
+                                        // the response, so it would look like success while the
+                                        // organizer is never told. Drop the entry (so we do not retry
+                                        // forever) and say so.
+                                        TbSync.eventlog.add("warning", syncData.eventLogInfo,
+                                            "Cannot send your response to this meeting invitation: the server does not offer the MeetingResponse command. "
+                                            + "Your local status was kept, but the organizer has not been informed - please respond in Outlook or Outlook Web instead.",
+                                            changes[i].itemId);
+                                        syncData.target.removeItemFromChangeLog(changes[i].itemId);
+                                        syncData.progressData.inc();
+                                    }
+                                    break;
+                                }
+
                                 let asversion = syncData.accountData.getAccountProperty("asversion");
                                 let isException = eas.sync.Calendar ? eas.sync.Calendar.isExceptionItem(item) : false;
 
@@ -637,6 +708,16 @@ var sync = {
             wbxml.ctag(); //Collections
             wbxml.ctag(); //Sync
 
+            // MeetingResponse is a separate EAS command, so any detected RSVP goes out on
+            // its own, ahead of the Sync request built above.
+            let sentInvitationResponse = false;
+            if (invitationResponses.length > 0) {
+                sentInvitationResponse = await eas.sync.sendInvitationResponses(syncData, invitationResponses);
+                // A MeetingResponse makes the server update the item (and the organizer's
+                // copy), so the caller has to wait for the delayed ack just as it does for
+                // an ordinary local change.
+                if (sentInvitationResponse) sendChanges = true;
+            }
 
             if (c > 0) { //if there was at least one actual local change, send request
                 sendChanges = true;
@@ -709,11 +790,13 @@ var sync = {
                     eas.network.updateSynckey(syncData, wbxmlData);
                 }
 
-            } else if (e == 0) { //if there was no local change and also no error (which will not happen twice) finish
+            } else if (e == 0 && !sentInvitationResponse) { //if there was no local change and also no error (which will not happen twice) finish
 
                 done = true;
 
             }
+            //if we did send RSVPs, their changelog entries are gone now - loop once more, so
+            //any remaining changes beyond this batch still get pushed during this run
 
         } while (!done);
 
@@ -722,6 +805,89 @@ var sync = {
             throw eas.sync.finish("warning", "ServerRejectedSomeItems::" + syncData.failedItems.length);
         }
         return sendChanges;
+    },
+
+
+    // Send the RSVPs collected by sendLocalChanges as EAS MeetingResponse commands
+    // (see eas.sync.Calendar.detectInvitationResponses / matchInvitationResponse for
+    // how they are recognised). Returns true if the server accepted at least one.
+    sendInvitationResponses: async function (syncData, invitationResponses) {
+        let anySent = false;
+        let asversion = syncData.accountData.getAccountProperty("asversion");
+
+        for (let invitation of invitationResponses) {
+            if (syncData.failedItems.includes(invitation.itemId)) continue;
+
+            // One item can carry several responses: the series plus any occurrence the
+            // user answered individually. Each needs its own MeetingResponse command.
+            let allSent = true;
+            let lastStatus = null;
+
+            for (let response of invitation.responses) {
+                if (response.instanceId && asversion == "2.5") {
+                    // EAS 2.5 has no InstanceId, so a single occurrence cannot be
+                    // addressed at all. Do not silently answer the whole series instead.
+                    TbSync.eventlog.add("warning", syncData.eventLogInfo,
+                        "Cannot send your response to a single occurrence of this recurring meeting: EAS 2.5 does not support it. "
+                        + "Please respond in Outlook or Outlook Web, or select a newer ActiveSync version.",
+                        invitation.itemId);
+                    continue;
+                }
+
+                let result = await eas.network.sendMeetingResponse(
+                    syncData, invitation.serverID, response.userResponse, response.instanceId);
+
+                if (!result.success) {
+                    allSent = false;
+                    lastStatus = result.status;
+                    continue;
+                }
+
+                anySent = true;
+
+                // Re-fetch each time: stamping rewrites the item, so a stale copy would
+                // clobber the previous stamp when several responses share one item.
+                let trackedItem = await syncData.target.getItem(invitation.serverID);
+                if (trackedItem) {
+                    await eas.sync.Calendar.stampInvitationResponse(
+                        trackedItem, response.partstat, response.exceptionId, syncData);
+                }
+            }
+
+            if (!allSent) {
+                // Keep the changelog entry (moved to the end of the log) so the response is
+                // retried on the next sync run instead of being silently lost. Responses
+                // that did succeed are already stamped, so they are not resent.
+                let failedItem = await syncData.target.getItem(invitation.itemId);
+                eas.sync.updateFailedItems(
+                    syncData,
+                    lastStatus ? lastStatus : "MeetingResponse.failed",
+                    invitation.itemId,
+                    failedItem ? failedItem.toString() : invitation.itemId);
+                continue;
+            }
+
+            // Everything is recorded server side now, so the local change no longer needs
+            // pushing. The stamping above ran with the entry still present, which is
+            // harmless: modifyItem pretags "_by_server", and this removal covers it.
+            syncData.target.removeItemFromChangeLog(invitation.itemId);
+            syncData.progressData.inc();
+
+            if (invitation.duplicateOf) {
+                // The changelog entry belonged to the duplicate Thunderbird's itip engine
+                // created, not to the synced copy the response was sent for. Unless we could
+                // match the server side UID the pairing is content based, so the duplicate is
+                // deliberately not deleted behind the user's back - we only stop pushing it.
+                TbSync.eventlog.add("warning", syncData.eventLogInfo,
+                    "Sent a meeting response for the already synchronized invitation <" + invitation.duplicateOf + ">, "
+                    + "because Thunderbird recorded the response in a second, local copy of the event"
+                    + (invitation.exactMatch ? "" : " (matched by subject and time)")
+                    + ". That copy was not sent to the server, but it is still in your calendar - delete it there if the event shows up twice.",
+                    invitation.itemId);
+            }
+        }
+
+        return anySent;
     },
 
 
@@ -1098,7 +1264,12 @@ var sync = {
         //EAS BusyStatus:  0 = Free  |  1 = Tentative  |  2 = Busy  |  3 = Work  |  4 = Elsewhere
         BusyStatus: { "0": "TRANSPARENT", "1": "unset", "2": "OPAQUE", "3": "OPAQUE", "4": "OPAQUE" }, //to TRANSP
         //EAS AttendeeStatus: 0 =Response unknown (but needed) |  2 = Tentative  |  3 = Accept  |  4 = Decline  |  5 = Not responded (and not needed) || 1 = Organizer in ResponseType
-        ATTENDEESTATUS: { "0": "NEEDS-ACTION", "1": "Orga", "2": "TENTATIVE", "3": "ACCEPTED", "4": "DECLINED", "5": "ACCEPTED" },
+        //5 is NOT "accepted": per MS-ASCAL it means "Not responded" on both AttendeeStatus and
+        //ResponseType, and a freshly sent, completely unanswered invitation arrives with 5.
+        //Mapping it to ACCEPTED made every brand new invitation look pre-accepted, and it also
+        //masked real Accept clicks from eas.sync.Calendar.detectInvitationResponses, because
+        //"already ACCEPTED" == "now ACCEPTED" meant no MeetingResponse was ever sent.
+        ATTENDEESTATUS: { "0": "NEEDS-ACTION", "1": "Orga", "2": "TENTATIVE", "3": "ACCEPTED", "4": "DECLINED", "5": "NEEDS-ACTION" },
     },
 
     MAP_TB2EAS: {

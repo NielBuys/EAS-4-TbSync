@@ -314,6 +314,18 @@
     "status.ServerRejectedRequest": {
         "message": "The EAS Server rejected the last request."
     },
+    "status.MeetingResponse.2": {
+        "message": "The server rejected the response to this meeting invitation as invalid (status 2)"
+    },
+    "status.MeetingResponse.3": {
+        "message": "The server could not access the mailbox to record the response to this meeting invitation (status 3)"
+    },
+    "status.MeetingResponse.4": {
+        "message": "Server error while recording the response to this meeting invitation (status 4)"
+    },
+    "status.MeetingResponse.failed": {
+        "message": "The response to this meeting invitation could not be sent to the server, it will be retried on the next synchronization"
+    },
     "status.ServerRejectedSomeItems": {
         "message": "The EAS server did not accept ##replace.1## elements."
     },

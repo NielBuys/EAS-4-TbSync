@@ -1045,6 +1045,94 @@ var network = {
         }
     },
 
+    // ---------------------------------------------------------------------------
+    // EAS MeetingResponse - [MS-ASCMD] 2.2.2.10 / 3.1.5.5
+    //
+    // Tells the server that the user accepted, tentatively accepted or declined a
+    // meeting invitation. This is the protocol correct channel for an RSVP and it
+    // must be used *instead* of pushing the changed attendee status back as a
+    // generic Sync <Change>: Exchange reads such a change as "the user created a
+    // new, self organized meeting", which duplicates the event and re-broadcasts
+    // invitations to every attendee. Once the server has our MeetingResponse it
+    // updates the organizer's copy and notifies the attendees itself.
+    //
+    // Returns
+    //   { success: true,  status: "" }           on Status 1
+    //   { success: false, status: <statusType> } on a soft server error, e.g.
+    //                                           "MeetingResponse.2" (invalid
+    //                                           meeting request), ".3" (mailbox
+    //                                           error) or ".4" (server error)
+    //   { success: false, status: null }         on a transport error or a
+    //                                           response without any data
+    // Hard errors (bad policy key, access denied, ...) are still thrown by
+    // checkStatus, exactly as for every other command.
+    // ---------------------------------------------------------------------------
+    sendMeetingResponse: async function (syncData, serverID, userResponse, instanceId = null) {
+        let collectionId = syncData.currentFolderData.getFolderProperty("serverID");
+        if (!collectionId || !serverID || !userResponse) {
+            return { success: false, status: null };
+        }
+
+        // BUILD WBXML
+        let wbxml = eas.wbxmltools.createWBXML();
+        wbxml.switchpage("MeetingResponse");
+        wbxml.otag("MeetingResponse");
+        wbxml.otag("Request");
+        wbxml.atag("UserResponse", String(userResponse));
+        // CollectionId and RequestId are tokens of the MeetingResponse codepage
+        // itself (0x06 / 0x08). They are *not* the AirSync CollectionId, so no
+        // switchpage is wanted here.
+        wbxml.atag("CollectionId", collectionId);
+        wbxml.atag("RequestId", serverID);
+        // A whole recurring series is one EAS item, so responding to a single
+        // occurrence is expressed by naming that instance rather than by addressing a
+        // different item. InstanceId is the occurrence's original start time in UTC and
+        // follows RequestId in the schema. Not available in EAS 2.5, whose callers must
+        // not pass one.
+        //
+        // MeetingResponseRequest.xsd restricts this to exactly 24 characters (the
+        // extended form 2026-08-10T07:45:00.000Z) - unlike the AirSyncBase InstanceId,
+        // which is the 16 character basic form. Getting it wrong is answered with
+        // Status 2, so refuse to send a malformed value rather than have the server
+        // reject the response as an invalid meeting.
+        if (instanceId) {
+            if (String(instanceId).length != 24) {
+                TbSync.eventlog.add("warning", syncData.eventLogInfo,
+                    "Not sending a meeting response for a single occurrence: InstanceId <" + instanceId + "> is not the 24 character format the protocol requires.",
+                    serverID);
+                return { success: false, status: null };
+            }
+            wbxml.atag("InstanceId", instanceId);
+        }
+        wbxml.ctag(); //Request
+        wbxml.ctag(); //MeetingResponse
+
+        //SEND REQUEST (re-using the localchanges sync states, this is a push)
+        syncData.setSyncState("send.request.localchanges");
+        let response = await eas.network.sendRequest(wbxml.getBytes(), "MeetingResponse", syncData, /* allowSoftFail */ true);
+
+        //VALIDATE RESPONSE
+        syncData.setSyncState("eval.response.localchanges");
+        let wbxmlData = eas.network.getDataFromResponse(response, eas.flags.allowEmptyResponse);
+        if (wbxmlData === null) {
+            return { success: false, status: null };
+        }
+
+        // A response without any status at all is not worth aborting the sync for -
+        // treat it like a transport error and let the caller retry on the next run,
+        // instead of letting checkStatus throw on the missing field.
+        if (!eas.xmltools.hasWbxmlDataField(wbxmlData, "MeetingResponse.Result.Status")
+            && !eas.xmltools.hasWbxmlDataField(wbxmlData, "MeetingResponse.Status")) {
+            return { success: false, status: null };
+        }
+
+        // Let checkStatus deal with the global status codes (provisioning, access
+        // denied, ...) but soft fail on the MeetingResponse specific ones, so a
+        // single rejected invitation does not abort the whole sync.
+        let errorcause = eas.network.checkStatus(syncData, wbxmlData, "MeetingResponse.Result.Status", "", true);
+        return { success: (errorcause === ""), status: errorcause };
+    },
+
     getUserInfo: async function (syncData) {
         if (!syncData.accountData.getAccountProperty("allowedEasCommands").split(",").includes("Settings")) {
             return;
