@@ -45,9 +45,20 @@ Calendar, contacts and task synchronization and editing work on 16.1. The protoc
 
 ## Meeting invitations (RSVP)
 
-**Accept / Tentative / Decline** on a received calendar invitation is sent back to the server with the EAS `MeetingResponse` command, so the organizer and the other attendees see your response. This works both for a whole meeting and for a **single occurrence** of a recurring one — answering one occurrence answers only that occurrence, matching Outlook.
+**Accept / Tentative / Decline** on a received calendar invitation is sent back to the server with the EAS `MeetingResponse` command, so your participation status is recorded server-side and stays correct across all your devices. This works both for a whole meeting and for a **single occurrence** of a recurring one — answering one occurrence answers only that occurrence, matching Outlook.
 
 Previously the changed attendee status was pushed as an ordinary item change. Exchange interpreted that as *you* creating a new, self-organized meeting — duplicating the event and re-inviting everybody — and for a recurring meeting it silently did nothing at all. A freshly received, unanswered invitation is also no longer shown as already accepted (`ResponseType`/`AttendeeStatus` value `5` means *not responded*, not *accepted*).
+
+### How the organizer gets told
+
+Two separate mechanisms are involved, and it is worth knowing which does what:
+
+- **The EAS `MeetingResponse` command** (this add-on) records your status on the server. It does **not** send any email: on protocol 16.x an email is only sent if the request carries a `SendResponse` element, and we deliberately omit it.
+- **Thunderbird's own iTIP handling** emails the organizer a reply ("Accepted: …") over SMTP, using the identity bound to the calendar. TbSync sets that identity on EAS calendars, so this happens on its own whenever you change your participation status.
+
+`SendResponse` is omitted **on purpose**: Thunderbird already sends the reply, so adding it would make Exchange send a second one and notify the organizer twice for every response. Please do not "fix" this by adding it.
+
+Whether the organizer's client then shows you as accepted depends on it processing that reply — which is out of this add-on's hands. Personal Outlook.com accounts in particular do not reliably fold an iTIP reply from an external domain into their attendee tracking.
 
 ### After upgrading from 4.17.x or earlier
 
