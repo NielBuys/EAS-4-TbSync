@@ -76,7 +76,9 @@ Invitations received after the upgrade are unaffected.
 ### Known limitations
 
 - **EAS 2.5 cannot answer a single occurrence** — the protocol has no `InstanceId` for `MeetingResponse`. The response is not sent and the event log says so, rather than answering the whole series behind your back. Use a newer ActiveSync version, or respond in Outlook.
-- **Answering from the invitation e-mail** can leave a duplicate event in your calendar. Thunderbird's own iTIP handling records the response in a second, local copy of the event instead of the copy TbSync synced. That copy is detected and is *not* pushed to the server — your response is sent for the synced event, and the TbSync event log says so — but the stray local copy is left in place. Delete it manually if the event shows up twice.
+- **Answering from the invitation e-mail** makes Thunderbird record the response in a second, local copy of the event rather than the copy TbSync synced. That copy is detected and never pushed to the server — your response is sent for the synced event instead, so the meeting is not duplicated and the other attendees are not re-invited. When the duplicate can be matched exactly, by the invitation UID, it is removed automatically. When it can only be matched by subject and time it is left in your calendar, because deleting on a heuristic is not worth the risk — delete it yourself if the event shows up twice. Either way the TbSync event log records what happened.
+
+  Note that the organizer is notified **once**, by Thunderbird's own iTIP reply. The EAS command sends no email of its own (see [How the organizer gets told](#how-the-organizer-gets-told)), so answering from the e-mail does not double-notify.
 - **Editing a received invitation while responding to it** in the same sync interval sends only the response; the other edits are not pushed. Exchange does not accept item edits from attendees anyway.
 
 ## Reporting problems

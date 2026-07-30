@@ -875,14 +875,36 @@ var sync = {
 
             if (invitation.duplicateOf) {
                 // The changelog entry belonged to the duplicate Thunderbird's itip engine
-                // created, not to the synced copy the response was sent for. Unless we could
-                // match the server side UID the pairing is content based, so the duplicate is
-                // deliberately not deleted behind the user's back - we only stop pushing it.
-                TbSync.eventlog.add("warning", syncData.eventLogInfo,
+                // created, not to the synced copy the response was sent for.
+                //
+                // On an exact match we know for certain the two are the same meeting: the
+                // duplicate is named with the invitation's UID and we matched it against the
+                // very same value stamped as X-EAS-UID. Nothing of the user's is lost by
+                // removing it - the response is already recorded on the synced copy, which
+                // stays in the calendar - so clean it up instead of leaving a visible
+                // duplicate behind. Deleted through the target so the changelog is pretagged
+                // "_by_server" and this never goes out as a user delete of a ServerId the
+                // server does not know.
+                //
+                // A subject+start+end match is only a heuristic, so that case is still left
+                // alone: we stop pushing it, but deleting a user's calendar item on a guess
+                // is not something to do behind their back.
+                let removed = false;
+                if (invitation.exactMatch) {
+                    let duplicateItem = await syncData.target.getItem(invitation.itemId);
+                    if (duplicateItem) {
+                        await syncData.target.deleteItem(duplicateItem);
+                        syncData.target.removeItemFromChangeLog(invitation.itemId);
+                        removed = true;
+                    }
+                }
+
+                TbSync.eventlog.add("info", syncData.eventLogInfo,
                     "Sent a meeting response for the already synchronized invitation <" + invitation.duplicateOf + ">, "
-                    + "because Thunderbird recorded the response in a second, local copy of the event"
-                    + (invitation.exactMatch ? "" : " (matched by subject and time)")
-                    + ". That copy was not sent to the server, but it is still in your calendar - delete it there if the event shows up twice.",
+                    + "because Thunderbird recorded the response in a second, local copy of the event. "
+                    + (removed
+                        ? "That copy matched the invitation exactly and has been removed from your calendar."
+                        : "That copy was matched by subject and time only, so it was not sent to the server but is still in your calendar - delete it there if the event shows up twice."),
                     invitation.itemId);
             }
         }
