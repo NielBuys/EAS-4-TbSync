@@ -32,6 +32,15 @@ const ICAL = TbSync.lightning.ICAL;
 
 var Calendar = {
 
+    // iCal PARTSTAT -> EAS MeetingResponse UserResponse ([MS-ASCMD] 2.2.3.166.3).
+    // Note this is a *different* numeric scale from AttendeeStatus/ResponseType
+    // (eas.sync.MAP_EAS2TB.ATTENDEESTATUS): 1 = Accept, 2 = Tentative, 3 = Decline.
+    MAP_PARTSTAT2USERRESPONSE: { "ACCEPTED": "1", "TENTATIVE": "2", "DECLINED": "3" },
+
+    // iCal PARTSTAT -> EAS ResponseType, used to re-stamp X-EAS-ResponseType after
+    // the server accepted our MeetingResponse. Same scale as AttendeeStatus.
+    MAP_PARTSTAT2RESPONSETYPE: { "TENTATIVE": "2", "ACCEPTED": "3", "DECLINED": "4" },
+
     // --------------------------------------------------------------------------- //
     // EAS 16.1 Helper: Is this item an exception occurrence?
     // --------------------------------------------------------------------------- //
@@ -215,6 +224,38 @@ var Calendar = {
                     TbSync.eventlog.add("info", syncdata, "Attendee without required name and/or email found. Skipped.");
                 }
             }
+        }
+
+        // X-EAS-ResponseType is our record of the participation status the *server*
+        // last reported for the local user. eas.sync.Calendar.detectInvitationResponses
+        // compares it against the live PARTSTAT to tell an RSVP (Accept / Tentative /
+        // Decline) apart from an ordinary edit, so it has to mirror exactly what the
+        // attendee loop above just wrote into the self attendee - otherwise a plain
+        // edit of a received meeting looks like an RSVP, or a real RSVP goes unnoticed.
+        // X-EAS-SelfPartstat records the participation status we just wrote into the
+        // user's own attendee entry from server data. detectInvitationResponses compares
+        // the live PARTSTAT against it to tell an RSVP apart from an ordinary edit.
+        //
+        // Reading the attendee back through the very same getSelfAttendee lookup the
+        // detection uses makes the two agree by construction, so an ordinary edit of a
+        // received meeting can never be mistaken for an RSVP - not even on a server that
+        // reports ResponseType and AttendeeStatus inconsistently, or that omits
+        // ResponseType altogether (it is missing in 2.5 and optional elsewhere).
+        //
+        // Skipped for a partial Change, which carries no attendee data and must not be
+        // allowed to blank an existing marker.
+        if (data.Attendees) {
+            let self = Calendar.getSelfAttendee(item, syncdata);
+            item.setProperty("X-EAS-SelfPartstat",
+                (self && self.participationStatus) ? self.participationStatus : "NEEDS-ACTION");
+        }
+
+        // The server side UID is not our item.id - that one holds the EAS ServerId.
+        // Thunderbird's own itip engine keys invitations by UID, so keeping the real
+        // UID around is what lets matchInvitationResponse pair a duplicate item
+        // created by itip with the copy we already synced. Not sent in EAS 16.1.
+        if (data.UID && eas.tools.isString(data.UID)) {
+            item.setProperty("X-EAS-UID", data.UID);
         }
 
         if (data.OrganizerName && data.OrganizerEmail && eas.tools.isString(data.OrganizerEmail)) {
@@ -532,6 +573,281 @@ var Calendar = {
         //TbSync.dump("ALARM ("+i+")", [, alarms[i].related, alarms[i].repeat, alarms[i].repeatOffset, alarms[i].repeatDate, alarms[i].action].join("|"));
 
         return wbxml.getBytes();
+    },
+
+    // --------------------------------------------------------------------------- //
+    // MeetingResponse (RSVP) helpers
+    //
+    // Accepting / tentatively accepting / declining an invitation has to be sent
+    // with the EAS MeetingResponse command (eas.network.sendMeetingResponse), never
+    // as a generic Sync <Change> of the item: Exchange reads such a change as "the
+    // user created a new, self organized meeting", duplicating the event and
+    // re-inviting every attendee. Once it has our MeetingResponse the server updates
+    // the organizer's copy and notifies the attendees itself.
+    //
+    // Everything below decides from item data alone, no UI hook or call stack
+    // sniffing needed, and is only ever called for Calendar folders.
+    // --------------------------------------------------------------------------- //
+
+    nativeItem: function (tbItem) {
+        return tbItem instanceof TbSync.lightning.TbItem ? tbItem.nativeItem : tbItem;
+    },
+
+    // The attendee entry of the local EAS user, or null.
+    getSelfAttendee: function (tbItem, syncdata) {
+        let item = Calendar.nativeItem(tbItem);
+        let userEmail = syncdata.accountData.getAccountProperty("user");
+        if (!userEmail) return null;
+        userEmail = userEmail.toLowerCase();
+        for (let attendee of item.getAttendees()) {
+            if (!attendee.id) continue;
+            if (cal.email.removeMailTo(attendee.id).toLowerCase() == userEmail) return attendee;
+        }
+        return null;
+    },
+
+    // Bit 0x2 of EAS MeetingStatus: the meeting was received from someone else, so
+    // the user is an attendee and not the organizer. We only ever set this property
+    // from server data, which means its absence also tells us that an item never
+    // came from the server. Occurrences do not always carry their own copy, so fall
+    // back to the master they belong to.
+    isReceivedMeeting: function (tbItem) {
+        let item = Calendar.nativeItem(tbItem);
+        for (let candidate of [item, item.parentItem]) {
+            if (!candidate || typeof candidate.hasProperty != "function") continue;
+            if (!candidate.hasProperty("X-EAS-MeetingStatus")) continue;
+            return (parseInt(candidate.getProperty("X-EAS-MeetingStatus"), 10) & 0x2) != 0;
+        }
+        return false;
+    },
+
+    // Every pending RSVP on this item: the series level response, plus one per modified
+    // occurrence.
+    //
+    // A whole recurring series is a single EAS item (one ServerId), so a changelog entry
+    // always names the master. Thunderbird, however, records an Accept clicked on one
+    // occurrence by creating an *exception* for it - which is what accepting a recurring
+    // invitation from the calendar view always does. The exception inherits the master's
+    // X-EAS-SelfPartstat while its own PARTSTAT changes, so the mismatch is visible here
+    // and is answered with MeetingResponse's InstanceId element.
+    //
+    // Returns an array of { userResponse, partstat, instanceId, exceptionId }, where
+    // instanceId is null for a series level response and otherwise the UTC timestamp
+    // identifying the occurrence. Empty when nothing is a real Accept/Tentative/Decline
+    // transition - the caller then treats the change as an ordinary edit.
+    detectInvitationResponses: function (tbItem, syncdata) {
+        let item = Calendar.nativeItem(tbItem);
+        if (!Calendar.isReceivedMeeting(item)) return [];
+
+        // Called with a single occurrence rather than the master.
+        if (Calendar.isExceptionItem(item)) {
+            let response = Calendar.compareSelfPartstat(item, syncdata);
+            if (!response) return [];
+            response.instanceId = Calendar.meetingResponseInstanceId(item.recurrenceId);
+            response.exceptionId = item.recurrenceId;
+            return [response];
+        }
+
+        let responses = [];
+
+        let master = Calendar.compareSelfPartstat(item, syncdata);
+        if (master) {
+            master.instanceId = null;
+            master.exceptionId = null;
+            responses.push(master);
+        }
+
+        if (item.recurrenceInfo) {
+            for (let exceptionId of item.recurrenceInfo.getExceptionIds({})) {
+                let exception = item.recurrenceInfo.getExceptionFor(exceptionId);
+                if (!exception) continue;
+                let response = Calendar.compareSelfPartstat(exception, syncdata);
+                if (!response) continue;
+                response.instanceId = Calendar.meetingResponseInstanceId(exceptionId);
+                response.exceptionId = exceptionId;
+                responses.push(response);
+            }
+        }
+
+        return responses;
+    },
+
+    // The occurrence identifier for MeetingResponse's InstanceId element.
+    //
+    // Beware: this is NOT the same format as the AirSyncBase InstanceId used when
+    // pushing a 16.1 exception change (getWbxmlFromThunderbirdException above), even
+    // though both are "a UTC timestamp identifying an occurrence". MeetingResponseRequest
+    // .xsd restricts InstanceId to exactly 24 characters, i.e. the extended form
+    // 2026-08-10T07:45:00.000Z, while AirSyncBase uses the 16 character basic form
+    // 20260810T074500Z. Sending the basic form here makes Exchange reject the whole
+    // request with MeetingResponse Status 2 ("invalid meeting request"), which is
+    // indistinguishable from a genuinely stale meeting - so keep the two apart.
+    meetingResponseInstanceId: function (occurrenceId) {
+        return eas.tools.getIsoUtcString(occurrenceId, /* requireExtendedISO */ true);
+    },
+
+    // The marker comparison for one item or occurrence: is the live participation status
+    // of the user's own attendee entry a real RSVP transition away from what the server
+    // last told us? Returns { userResponse, partstat } or null (no self attendee, no
+    // change, a status MeetingResponse has no code for such as a reset to NEEDS-ACTION,
+    // or a status we cannot vouch for - see the marker check below).
+    compareSelfPartstat: function (item, syncdata) {
+        // X-EAS-SelfPartstat doubles as a version marker, and its absence must never be
+        // treated as "NEEDS-ACTION". Items synced by a build before this property
+        // existed carry a PARTSTAT produced by the old AttendeeStatus mapping, which
+        // turned "not responded" (5) into ACCEPTED. Comparing a live ACCEPTED against an
+        // assumed NEEDS-ACTION would look like a real Accept transition and fire a
+        // MeetingResponse for an invitation the user never answered - on any local write
+        // to the item, including Thunderbird acknowledging a reminder. So treat a
+        // missing marker as "server side status unknown" and stay out of the way until
+        // the item has been re-read from the server.
+        if (!item.hasProperty("X-EAS-SelfPartstat")) return null;
+        let lastPartstat = item.getProperty("X-EAS-SelfPartstat");
+
+        let attendee = Calendar.getSelfAttendee(item, syncdata);
+        if (!attendee) return null;
+
+        let currentPartstat = attendee.participationStatus ? attendee.participationStatus : "NEEDS-ACTION";
+        if (currentPartstat == lastPartstat) return null;
+
+        let userResponse = Calendar.MAP_PARTSTAT2USERRESPONSE[currentPartstat];
+        if (!userResponse) return null;
+
+        return { userResponse: userResponse, partstat: currentPartstat };
+    },
+
+    // Record the response once the server accepted our MeetingResponse, so the next
+    // sync pass does not detect and re-send it. Written via target.modifyItem, which
+    // pretags the changelog with a "_by_server" entry, so this write is not mistaken
+    // for yet another user change. exceptionId selects a single occurrence; pass null
+    // to stamp the series itself.
+    stampInvitationResponse: async function (tbItem, partstat, exceptionId, syncdata) {
+        let responseType = Calendar.MAP_PARTSTAT2RESPONSETYPE[partstat];
+        let newItem = tbItem.clone();
+
+        if (exceptionId) {
+            let master = Calendar.nativeItem(newItem);
+            if (!master.recurrenceInfo) return;
+            let exception = master.recurrenceInfo.getExceptionFor(exceptionId);
+            if (!exception) return;
+            let stamped = exception.clone();
+            stamped.setProperty("X-EAS-SelfPartstat", partstat);
+            if (responseType) stamped.setProperty("X-EAS-ResponseType", responseType);
+            master.recurrenceInfo.modifyException(stamped, true);
+        } else {
+            newItem.setProperty("X-EAS-SelfPartstat", partstat);
+            if (responseType) newItem.setProperty("X-EAS-ResponseType", responseType);
+        }
+
+        await syncdata.target.modifyItem(newItem, tbItem);
+    },
+
+    // Thunderbird's own itip engine answers an emailed invitation by looking for a
+    // calendar item carrying the *organizer's* UID. Our synced copy is stored under
+    // the EAS ServerId instead, so itip usually finds nothing and records the
+    // response in a second, parallel item that has none of our X-EAS-* markers.
+    // Pushed as a plain Add, Exchange turns that into a brand new self organized
+    // meeting: the event is duplicated and everybody is invited again.
+    //
+    // Recognise such an item and pair it with the copy we already synced, preferring
+    // an exact match on the server side UID stamped as X-EAS-UID (not available in
+    // EAS 16.1, which does not send UID) and falling back to subject + start + end.
+    //
+    // Returns { serverID, userResponse, partstat, exact } for the tracked item the
+    // response belongs to, or null when this really is a new meeting the user is
+    // organizing.
+    matchInvitationResponse: async function (candidateTbItem, syncdata) {
+        let candidate = Calendar.nativeItem(candidateTbItem);
+
+        // Everything we ever pulled from the server carries X-EAS-MeetingStatus, so
+        // its presence means this is not an itip created item and must not be matched.
+        if (candidate.hasProperty("X-EAS-MeetingStatus")) return null;
+        if (Calendar.isExceptionItem(candidate)) return null;
+        if (!candidate.startDate || !candidate.endDate) return null;
+
+        // Without an actual response this is just a new meeting the user created.
+        let attendee = Calendar.getSelfAttendee(candidate, syncdata);
+        if (!attendee) return null;
+        let partstat = attendee.participationStatus;
+        let userResponse = Calendar.MAP_PARTSTAT2USERRESPONSE[partstat];
+        if (!userResponse) return null;
+
+        let candidateTitle = candidate.title ? candidate.title.trim() : "";
+        let items = await Calendar.getItemsInRange(syncdata.target.calendar, candidate.startDate, candidate.endDate, syncdata);
+
+        let fuzzyMatch = null;
+        for (let existing of items) {
+            if (existing.id == candidate.id) continue;
+            if (!Calendar.isReceivedMeeting(existing)) continue;
+
+            // Exact: the UID of the invitation, which is also the id itip gave the
+            // item it created.
+            if (candidate.id && existing.hasProperty("X-EAS-UID") && existing.getProperty("X-EAS-UID") == candidate.id) {
+                return { serverID: existing.id, userResponse: userResponse, partstat: partstat, exact: true };
+            }
+
+            if (fuzzyMatch === null
+                && candidateTitle
+                && existing.title && existing.title.trim() == candidateTitle
+                && existing.startDate && existing.startDate.compare(candidate.startDate) == 0
+                && existing.endDate && existing.endDate.compare(candidate.endDate) == 0) {
+                // do not return yet, an exact UID match further down the list wins
+                fuzzyMatch = existing.id;
+            }
+        }
+
+        if (fuzzyMatch) {
+            return { serverID: fuzzyMatch, userResponse: userResponse, partstat: partstat, exact: false };
+        }
+        return null;
+    },
+
+    // Master events of a calendar overlapping [rangeStart, rangeEnd], widened by a
+    // day on each side to stay clear of timezone and all-day edge cases. Thunderbird
+    // moved calICalendar.getItems from a callback to an array to a ReadableStream
+    // over the years, so detect the shape instead of pinning one - and never let a
+    // future change of that API break the sync: an empty result only means we do not
+    // recognize a duplicate, it does not lose any data.
+    getItemsInRange: async function (calendar, rangeStart, rangeEnd, syncdata) {
+        try {
+            let oneDayBack = cal.createDuration();
+            oneDayBack.inSeconds = -86400;
+            let oneDayAhead = cal.createDuration();
+            oneDayAhead.inSeconds = 86400;
+
+            let from = rangeStart.clone();
+            from.addDuration(oneDayBack);
+            let to = rangeEnd.clone();
+            to.addDuration(oneDayAhead);
+
+            // no ITEM_FILTER_CLASS_OCCURRENCES, we only want the master items
+            let filter = Components.interfaces.calICalendar.ITEM_FILTER_TYPE_EVENT;
+
+            if (typeof calendar.getItemsAsArray == "function") {
+                return await calendar.getItemsAsArray(filter, 0, from, to);
+            }
+
+            let result = calendar.getItems(filter, 0, from, to);
+            if (result && typeof result.getReader == "function") {
+                let items = [];
+                let reader = result.getReader();
+                for (; ;) {
+                    let chunk = await reader.read();
+                    if (chunk.done) break;
+                    if (Array.isArray(chunk.value)) items.push(...chunk.value);
+                    else if (chunk.value) items.push(chunk.value);
+                }
+                return items;
+            }
+
+            let resolved = await result;
+            return Array.isArray(resolved) ? resolved : [];
+        } catch (e) {
+            TbSync.eventlog.add("info", syncdata ? syncdata.eventLogInfo : null,
+                "Could not enumerate calendar items, cannot check whether this is a duplicate invitation response.",
+                e.message);
+            return [];
+        }
     }
 }
 // Export Calendar object so sync.js can use it
