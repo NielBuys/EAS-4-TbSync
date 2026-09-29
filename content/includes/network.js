@@ -87,6 +87,23 @@ function dumpAllResponseHeaders(req, label) {
     TbSync.dump(label, "\n" + headers.join("\n"));
 }
 
+// The documented way to tell an Exchange front end which mailbox a request is for
+// is the X-AnchorMailbox header. The DefaultAnchorMailbox cookie is a workaround
+// for clients that cannot set headers - and a cookie the browser may or may not
+// attach is a fragile thing to route on, which is exactly the failure we are
+// chasing. Thunderbird can set headers, so send the header too. Microsoft hosts
+// only: an unknown header is harmless, but there is no reason to change what
+// on-premise Exchange and Z-Push servers receive.
+function setAnchorMailboxHeader(req, { user, anchorMailbox }, uri) {
+    if (!["eas.outlook.com", "outlook.office365.com"].includes(uri.host)) return;
+    let value = anchorMailbox || user;
+    if (!value) return;
+    // The cookie arrives percent-encoded; the header wants the plain address.
+    try { value = decodeURIComponent(value); } catch (e) { }
+    req.setRequestHeader("X-AnchorMailbox", value);
+    TbSync.dump("X-AnchorMailbox", value);
+}
+
 function getSandBoxedXHR({ user, accountname, anchorMailbox }, uri, containerReset = false) {
     // The content principal used for the sandbox honours CORS. A server redirect
     // to a different server may cause CORS violations. We implemented code to
@@ -574,6 +591,7 @@ var network = {
             syncData.req.overrideMimeType("text/plain");
             syncData.req.setRequestHeader("User-Agent", userAgent);
             syncData.req.setRequestHeader("Content-Type", "application/vnd.ms-sync.wbxml");
+            setAnchorMailboxHeader(syncData.req, contextData, uri);
             if (password) {
                 if (eas.network.getOAuthObj({ accountData: syncData.accountData })) {
                     syncData.req.setRequestHeader("Authorization", 'Bearer ' + eas.network.getOAuthValue(password, "access"));
@@ -1307,6 +1325,7 @@ var network = {
                     req.overrideMimeType("text/plain");
                     req.setRequestHeader("User-Agent", userAgent);
                     req.setRequestHeader("Content-Type", "application/vnd.ms-sync.wbxml");
+                    setAnchorMailboxHeader(req, contextData, uri);
 
                     if (password) {
                         if (eas.network.getOAuthObj({ accountData })) {
@@ -1442,6 +1461,7 @@ var network = {
                 syncData.req.open("OPTIONS", uri.spec, true);
                 syncData.req.overrideMimeType("text/plain");
                 syncData.req.setRequestHeader("User-Agent", userAgent);
+                setAnchorMailboxHeader(syncData.req, contextData, uri);
                 if (password) {
                     if (eas.network.getOAuthObj({ accountData: syncData.accountData })) {
                         syncData.req.setRequestHeader("Authorization", 'Bearer ' + eas.network.getOAuthValue(password, "access"));
