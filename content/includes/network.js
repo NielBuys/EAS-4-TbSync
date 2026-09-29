@@ -49,7 +49,29 @@ function getContainerIdForContainerName(containerName) {
     return (idx == -1) ? containers.push(containerName) - 1 + min : (idx + min);
 }
 
-function getSandBoxedXHR({ user, accountname }, uri, containerReset = false) {
+// eas.outlook.com answers a request aimed at the wrong mailbox with a 451 and
+// a Set-Cookie naming the mailbox it actually wants. That cookie is SameSite=None
+// without the secure flag, so Thunderbird drops it and never sends it back - we
+// have to lift the value out of the raw headers and re-set it ourselves.
+function getAnchorMailboxFromResponse(req) {
+    let anchorMailbox = "";
+    try {
+        const channel = req.channel.QueryInterface(Ci.nsIHttpChannel);
+        channel.visitOriginalResponseHeaders({
+            visitHeader(name, value) {
+                if (!/^set-cookie$/i.test(name)) return;
+                TbSync.dump("Received cookie", value);
+                let match = /(?:^|;\s*)DefaultAnchorMailbox=([^;]*)/i.exec(value);
+                if (match && match[1].trim()) anchorMailbox = match[1].trim();
+            },
+        });
+    } catch (e) {
+        // A request that never reached the network has no channel to inspect.
+    }
+    return anchorMailbox;
+}
+
+function getSandBoxedXHR({ user, accountname, anchorMailbox }, uri, containerReset = false) {
     // The content principal used for the sandbox honours CORS. A server redirect
     // to a different server may cause CORS violations. We implemented code to
     // catch such redirects and re-run the request with the correct sandbox. If
@@ -65,13 +87,14 @@ function getSandBoxedXHR({ user, accountname }, uri, containerReset = false) {
     
     // Pre-set cookie needed by eas.outlook.com. The cookie is returned with each
     // server response, but is is SameSite=None without the secure flag being set
-    // and ignored.
+    // and ignored. The user name is only a guess at the anchor mailbox; once the
+    // server has told us the real one via a 451, anchorMailbox holds it.
     if (uri.host == "eas.outlook.com") {
         Services.cookies.add(
             "eas.outlook.com",
             "/",
             "DefaultAnchorMailbox",
-            user,
+            anchorMailbox || user,
             /* isSecure */ true,
             /* isHttponly */ false,
             /* isSession = */ false,
@@ -150,12 +173,14 @@ var network = {
         if (contextData.accountData) {
             contextData.accountname = contextData.accountData.getAccountProperty("accountname");
             contextData.user = contextData.accountData.getAccountProperty("user");
+            contextData.anchorMailbox = contextData.accountData.getAccountProperty("anchorMailbox");
             contextData.host = contextData.accountData.getAccountProperty("host");
             contextData.servertype = contextData.accountData.getAccountProperty("servertype");
             contextData.accountID = contextData.accountData.accountID;
         } else {
             contextData.accountname = (configObject && configObject.hasOwnProperty("accountname")) ? configObject.accountname : "";
             contextData.user = (configObject && configObject.hasOwnProperty("user")) ? configObject.user : "";
+            contextData.anchorMailbox = (configObject && configObject.hasOwnProperty("anchorMailbox")) ? configObject.anchorMailbox : "";
             contextData.host = (configObject && configObject.hasOwnProperty("host")) ? configObject.host : "";
             contextData.servertype = (configObject && configObject.hasOwnProperty("servertype")) ? configObject.servertype : "";
             contextData.accountID = "";
@@ -580,17 +605,6 @@ var network = {
             syncData.req.onload = function () {
                 let response = syncData.req.responseText;
 
-                // Debug: Log received cookies.
-                const channel = syncData.req.channel.QueryInterface(Ci.nsIHttpChannel);
-                const SET_COOKIE_REGEXP = /set-cookie/i;
-                channel.visitOriginalResponseHeaders({
-                    visitHeader(name, value) {
-                        if (SET_COOKIE_REGEXP.test(name)) {
-                            console.log("Received cookie", value);
-                        }
-                    },
-                });
-
                 switch (syncData.req.status) {
 
                     case 200: //OK
@@ -622,15 +636,59 @@ var network = {
                         reject(eas.sync.finish("resyncAccount", syncData.req.status));
                         break;
 
-                    case 451: // Redirect - update host and login manager 
-                        let header = syncData.req.getResponseHeader("X-MS-Location");
-                        let newHost = header.slice(header.indexOf("://") + 3, header.indexOf("/M"));
+                    case 451: { // Redirect - update host and/or anchor mailbox
+                        // eas.outlook.com uses 451 for two different things: a real move to
+                        // another server, and "you asked the wrong mailbox", where the
+                        // redirect points straight back at the host we just called and the
+                        // only new information is the DefaultAnchorMailbox cookie. Resyncing
+                        // without picking that cookie up replays the identical request until
+                        // the rerun budget is gone, which the user sees as a bare
+                        // "resync-loop" with nothing to act on.
+                        let header = syncData.req.getResponseHeader("X-MS-Location") || "";
+                        // Everything between the scheme and the /Microsoft-Server-ActiveSync
+                        // suffix, so a server living under a path prefix keeps it - getEasURL()
+                        // re-appends the suffix. Matching the whole suffix rather than "/M"
+                        // stops a prefix such as /Mail from being swallowed, and a 451 with no
+                        // usable X-MS-Location leaves newHost empty instead of throwing.
+                        let schemeEnd = header.indexOf("://");
+                        let suffixStart = header.indexOf("/Microsoft-Server-ActiveSync");
+                        let newHost = (schemeEnd != -1 && suffixStart > schemeEnd)
+                            ? header.slice(schemeEnd + 3, suffixStart)
+                            : "";
+                        let oldHost = syncData.accountData.getAccountProperty("host");
 
-                        TbSync.dump("redirect (451)", "header: " + header + ", oldHost: " + syncData.accountData.getAccountProperty("host") + ", newHost: " + newHost);
+                        let oldAnchorMailbox = syncData.accountData.getAccountProperty("anchorMailbox") || syncData.accountData.getAccountProperty("user");
+                        let newAnchorMailbox = getAnchorMailboxFromResponse(syncData.req);
 
-                        syncData.accountData.setAccountProperty("host", newHost);
+                        TbSync.dump("redirect (451)", "header: " + header +
+                            ", oldHost: " + oldHost + ", newHost: " + newHost +
+                            ", oldAnchorMailbox: " + oldAnchorMailbox +
+                            ", newAnchorMailbox: " + (newAnchorMailbox || "<none returned>"));
+
+                        let progress = false;
+                        if (newHost && newHost != oldHost) {
+                            syncData.accountData.setAccountProperty("host", newHost);
+                            progress = true;
+                        }
+                        if (newAnchorMailbox && newAnchorMailbox != oldAnchorMailbox) {
+                            syncData.accountData.setAccountProperty("anchorMailbox", newAnchorMailbox);
+                            progress = true;
+                        }
+
+                        if (!progress) {
+                            // Same server, same anchor mailbox: the next attempt would be the
+                            // request that just failed. Drop the stored anchor so a retry starts
+                            // over from the user name - if we had cached a stale one, that alone
+                            // fixes it, and if the anchor was right the server will just hand it
+                            // back on the next 451.
+                            syncData.accountData.resetAccountProperty("anchorMailbox");
+                            reject(eas.sync.finish("error", "redirect-loop::" + header));
+                            break;
+                        }
+
                         reject(eas.sync.finish("resyncAccount", syncData.req.status));
                         break;
+                    }
 
                     default:
                         if (allowSoftFail) {
