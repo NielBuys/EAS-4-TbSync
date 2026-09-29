@@ -71,6 +71,22 @@ function getAnchorMailboxFromResponse(req) {
     return anchorMailbox;
 }
 
+// A 451 we cannot act on is only useful if we can see what the server actually
+// said. getResponseHeader() is limited to what the CORS layer exposes, so go to
+// the channel for the unfiltered set.
+function dumpAllResponseHeaders(req, label) {
+    let headers = [];
+    try {
+        const channel = req.channel.QueryInterface(Ci.nsIHttpChannel);
+        channel.visitOriginalResponseHeaders({
+            visitHeader(name, value) { headers.push(name + ": " + value); },
+        });
+    } catch (e) {
+        headers.push("<no channel to inspect: " + e + ">");
+    }
+    TbSync.dump(label, "\n" + headers.join("\n"));
+}
+
 function getSandBoxedXHR({ user, accountname, anchorMailbox }, uri, containerReset = false) {
     // The content principal used for the sandbox honours CORS. A server redirect
     // to a different server may cause CORS violations. We implemented code to
@@ -660,17 +676,28 @@ var network = {
                         let oldAnchorMailbox = syncData.accountData.getAccountProperty("anchorMailbox") || syncData.accountData.getAccountProperty("user");
                         let newAnchorMailbox = getAnchorMailboxFromResponse(syncData.req);
 
+                        // The cookie arrives percent-encoded ("user%40outlook.com") while the
+                        // user name does not, so compare the decoded forms - otherwise the same
+                        // mailbox spelled two ways looks like new information and costs a rerun.
+                        // The raw value is what gets stored: that is what the server set, and
+                        // what it expects echoed back.
+                        let sameMailbox = (a, b) => {
+                            let decode = (v) => { try { return decodeURIComponent(v); } catch (e) { return v; } };
+                            return decode(a).toLowerCase() == decode(b).toLowerCase();
+                        };
+
                         TbSync.dump("redirect (451)", "header: " + header +
                             ", oldHost: " + oldHost + ", newHost: " + newHost +
                             ", oldAnchorMailbox: " + oldAnchorMailbox +
                             ", newAnchorMailbox: " + (newAnchorMailbox || "<none returned>"));
+                        dumpAllResponseHeaders(syncData.req, "redirect (451) response headers");
 
                         let progress = false;
                         if (newHost && newHost != oldHost) {
                             syncData.accountData.setAccountProperty("host", newHost);
                             progress = true;
                         }
-                        if (newAnchorMailbox && newAnchorMailbox != oldAnchorMailbox) {
+                        if (newAnchorMailbox && !sameMailbox(newAnchorMailbox, oldAnchorMailbox)) {
                             syncData.accountData.setAccountProperty("anchorMailbox", newAnchorMailbox);
                             progress = true;
                         }
@@ -1481,6 +1508,13 @@ var network = {
                             break;
 
                         default:
+                            // Anything else is swallowed so the sync can carry on with the
+                            // protocol versions it already has - but it used to vanish without
+                            // trace, which made a server that rejects every request look like
+                            // one that only rejects Sync. Record it.
+                            TbSync.dump("EAS OPTIONS with response (status: " + syncData.req.status + ")",
+                                "responseText: " + syncData.req.responseText);
+                            dumpAllResponseHeaders(syncData.req, "EAS OPTIONS response headers");
                             resolve();
                             break;
 
