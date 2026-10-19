@@ -104,6 +104,37 @@ function setAnchorMailboxHeader(req, { user, anchorMailbox }, uri) {
     TbSync.dump("X-AnchorMailbox", value);
 }
 
+// pvones isolated #16 to the cookie jar (see the issue): with a
+// DefaultAnchorMailbox cookie present the account syncs, and with the jar
+// cleared TbSync loops on a 451 - the cookie is doing real routing work after
+// all. The jar is the wrong place to keep it. The cookie is stored under the
+// container's userContextId, but `containers` is an in-memory array that hands
+// those ids out in first-seen order and forgets them on shutdown, so a restart
+// or a different add-on load order can look the cookie up in a different jar
+// than the one it was written to. From the outside that looks exactly like
+// "the Thunderbird update reset my cookie storage".
+//
+// So send the value as a request header instead, where nothing in storage has
+// to survive and no origin attribute has to match. XHR treats Cookie as a
+// forbidden header, so set it on the channel, which does not. If the jar does
+// hold a cookie, Gecko overwrites this with the stored one - the same value -
+// and if it does not, Gecko leaves what we set alone, which is the whole point.
+function setAnchorMailboxCookie(req, { user, anchorMailbox }, uri) {
+    if (uri.host != "eas.outlook.com") return;
+    // Send exactly what the pre-set cookie holds: the raw value, percent-encoded
+    // as the server wrote it. This is the form every working account uses.
+    let value = anchorMailbox || user;
+    if (!value) return;
+    try {
+        req.channel
+            .QueryInterface(Ci.nsIHttpChannel)
+            .setRequestHeader("Cookie", "DefaultAnchorMailbox=" + value, false);
+        TbSync.dump("DefaultAnchorMailbox (header)", value);
+    } catch (e) {
+        TbSync.dump("DefaultAnchorMailbox (header) failed", "" + e);
+    }
+}
+
 function getSandBoxedXHR({ user, accountname, anchorMailbox }, uri, containerReset = false) {
     // The content principal used for the sandbox honours CORS. A server redirect
     // to a different server may cause CORS violations. We implemented code to
@@ -123,20 +154,33 @@ function getSandBoxedXHR({ user, accountname, anchorMailbox }, uri, containerRes
     // and ignored. The user name is only a guess at the anchor mailbox; once the
     // server has told us the real one via a 451, anchorMailbox holds it.
     if (uri.host == "eas.outlook.com") {
-        Services.cookies.add(
-            "eas.outlook.com",
-            "/",
-            "DefaultAnchorMailbox",
-            anchorMailbox || user,
-            /* isSecure */ true,
-            /* isHttponly */ false,
-            /* isSession = */ false,
-            /* expiry */ Number.MAX_SAFE_INTEGER,
-            { userContextId },
-            Ci.nsICookie.SAMESITE_NONE,
-            Ci.nsICookie.SCHEME_HTTPS,
-            /* partitioned */ false
-        );
+        // Write it into the container's jar and into the default one. Which jar
+        // the channel reads from depends on origin attributes we do not fully
+        // control, and #16 is an account that works when the cookie happens to
+        // sit in the default jar and loops when it does not. Two cheap writes
+        // beat guessing which jar is the live one.
+        for (let originAttributes of [{ userContextId }, {}]) {
+            try {
+                Services.cookies.add(
+                    "eas.outlook.com",
+                    "/",
+                    "DefaultAnchorMailbox",
+                    anchorMailbox || user,
+                    /* isSecure */ true,
+                    /* isHttponly */ false,
+                    /* isSession = */ false,
+                    /* expiry */ Number.MAX_SAFE_INTEGER,
+                    originAttributes,
+                    Ci.nsICookie.SAMESITE_NONE,
+                    Ci.nsICookie.SCHEME_HTTPS,
+                    /* partitioned */ false
+                );
+            } catch (e) {
+                // A cookie we could not store is worth knowing about: it used to
+                // fail silently and surface three requests later as a 451 loop.
+                TbSync.dump("DefaultAnchorMailbox cookie rejected", "" + e);
+            }
+        }
     }
     if (!sandboxes.hasOwnProperty(containerName)) {
         console.log("Creating sandbox for <" + containerName + ">");
@@ -592,6 +636,7 @@ var network = {
             syncData.req.setRequestHeader("User-Agent", userAgent);
             syncData.req.setRequestHeader("Content-Type", "application/vnd.ms-sync.wbxml");
             setAnchorMailboxHeader(syncData.req, contextData, uri);
+            setAnchorMailboxCookie(syncData.req, contextData, uri);
             if (password) {
                 if (eas.network.getOAuthObj({ accountData: syncData.accountData })) {
                     syncData.req.setRequestHeader("Authorization", 'Bearer ' + eas.network.getOAuthValue(password, "access"));
@@ -1326,6 +1371,7 @@ var network = {
                     req.setRequestHeader("User-Agent", userAgent);
                     req.setRequestHeader("Content-Type", "application/vnd.ms-sync.wbxml");
                     setAnchorMailboxHeader(req, contextData, uri);
+                    setAnchorMailboxCookie(req, contextData, uri);
 
                     if (password) {
                         if (eas.network.getOAuthObj({ accountData })) {
@@ -1462,6 +1508,7 @@ var network = {
                 syncData.req.overrideMimeType("text/plain");
                 syncData.req.setRequestHeader("User-Agent", userAgent);
                 setAnchorMailboxHeader(syncData.req, contextData, uri);
+                setAnchorMailboxCookie(syncData.req, contextData, uri);
                 if (password) {
                     if (eas.network.getOAuthObj({ accountData: syncData.accountData })) {
                         syncData.req.setRequestHeader("Authorization", 'Bearer ' + eas.network.getOAuthValue(password, "access"));
