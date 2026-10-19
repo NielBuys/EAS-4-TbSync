@@ -431,6 +431,9 @@
     "status.response-contains-no-data": {
         "message": "Response from the server contains no data."
     },
+    "status.redirect-loop": {
+        "message": "The server redirected the account back to itself and offered no new location (##replace.1##). The saved mailbox anchor has been cleared, so please try syncing again. If the error repeats, the mailbox has probably moved and the account needs to be set up again."
+    },
     "status.resync-loop": {
         "message": "There was an error from which we could not recover by resyncing the account. Please disable the account and try again. (Error: resync loop)"
     },

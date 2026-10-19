@@ -268,6 +268,9 @@ var Base = class {
             "asversion": "",
             "host": "",
             "user": "",
+            // Mailbox eas.outlook.com wants requests anchored to. Empty until a
+            // 451 tells us it differs from the user name (see network.js).
+            "anchorMailbox": "",
             "servertype": "",
             "seperator": "10",
             "https": true,
