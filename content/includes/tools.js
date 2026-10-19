@@ -281,15 +281,21 @@ var tools = {
         let UTC = date.getInTimezone(eas.utcTimezone);
         if (fakeUTC) UTC = date.clone();
 
+        // Must return a string in both branches. It used to return the number
+        // unchanged for values >= 10, and the only caller that starts its
+        // concatenation with UTC.year - also a number - then added instead of
+        // concatenating: 2026 + 10 + 26 came out as 2062, not "20261026". That
+        // made every all-day event unsendable in October, November and December
+        // and fine for the rest of the year.
         function pad(number) {
             if (number < 10) {
                 return '0' + number;
             }
-            return number;
+            return '' + number;
         }
         
         if (onlyDate && fakeUTC) {
-            return UTC.year + pad(UTC.month + 1) + pad(UTC.day) + "T000000Z" ;
+            return String(UTC.year) + pad(UTC.month + 1) + pad(UTC.day) + "T000000Z";
         }
 
         if (requireExtendedISO) {
